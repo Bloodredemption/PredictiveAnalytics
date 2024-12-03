@@ -2,6 +2,7 @@ import pandas as pd
 import requests
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
 from dateutil.relativedelta import relativedelta
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
@@ -32,6 +33,7 @@ class PredictionResponse(BaseModel):
     recyclable: float
     start_date: str
     end_date: str
+    mean_accuracy: float  # Mean accuracy of the model
 
 @app.get("/predict-next-month", response_model=PredictionResponse)
 async def predict_next_month():
@@ -69,15 +71,23 @@ async def predict_next_month():
     X = data_pivot[['biodegradable_lag1', 'residual_lag1', 'recyclable_lag1']]
     y = data_pivot[['Biodegradable', 'Residual', 'Recyclable']]
 
-    # Check data size before splitting
+    # Initialize variables for mean accuracy and train/test sets
+    mean_accuracy = None
+    X_train, X_test, y_train, y_test = None, None, None, None
+
     if len(X) < 2:
+        # Not enough data to split; train with all data
         model = LinearRegression()
         model.fit(X, y)
     else:
-        # Train-test split if data size is sufficient
+        # Train-test split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         model = LinearRegression()
         model.fit(X_train, y_train)
+
+        # Calculate mean accuracy (R² score)
+        y_pred = model.predict(X_test)
+        mean_accuracy = r2_score(y_test, y_pred)
 
     # Predict next month
     last_month_data = X.tail(1)
@@ -94,5 +104,8 @@ async def predict_next_month():
         residual=next_month_prediction[0][1],
         recyclable=next_month_prediction[0][2],
         start_date=str(next_month_start.date()),
-        end_date=str(next_month_end.date())
+        end_date=str(next_month_end.date()),
+        mean_accuracy=mean_accuracy if mean_accuracy is not None else 0.0  # Return 0.0 if not calculated
     )
+
+# uvicorn app:app --reload
