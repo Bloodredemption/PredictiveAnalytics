@@ -1,13 +1,15 @@
 import pandas as pd
 import requests
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from dateutil.relativedelta import relativedelta
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import numpy as np
 
 app = FastAPI()
 
@@ -33,7 +35,16 @@ class PredictionResponse(BaseModel):
     recyclable: float
     start_date: str
     end_date: str
-    mean_accuracy: float  # Mean accuracy of the model
+    performance_metrics: dict
+
+def symmetric_mape(y_true, y_pred):
+    """
+    Symmetric Mean Absolute Percentage Error (sMAPE) to handle zero values.
+    Returns the mean sMAPE score as a percentage.
+    """
+    numerator = np.abs(y_true - y_pred)
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
+    return np.mean(np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0)) * 100
 
 @app.get("/predict-next-month", response_model=PredictionResponse)
 async def predict_next_month():
@@ -61,36 +72,69 @@ async def predict_next_month():
 
     # Pivot table to separate waste types
     data_pivot = data.pivot_table(index='date', columns='waste_type', values='metrics', fill_value=0)
+    
     # Create lag features for each waste type
     data_pivot['biodegradable_lag1'] = data_pivot['Biodegradable'].shift(30, fill_value=0)
     data_pivot['residual_lag1'] = data_pivot['Residual'].shift(30, fill_value=0)
     data_pivot['recyclable_lag1'] = data_pivot['Recyclable'].shift(30, fill_value=0)
+    
+    # Create rolling mean features for trend (optional improvement)
+    data_pivot['biodegradable_rolling_mean'] = data_pivot['Biodegradable'].rolling(window=3).mean()
+    data_pivot['residual_rolling_mean'] = data_pivot['Residual'].rolling(window=3).mean()
+    data_pivot['recyclable_rolling_mean'] = data_pivot['Recyclable'].rolling(window=3).mean()
+    
     data_pivot.dropna(inplace=True)
 
     # Define features (X) and target (y)
-    X = data_pivot[['biodegradable_lag1', 'residual_lag1', 'recyclable_lag1']]
+    X = data_pivot[['biodegradable_lag1', 'residual_lag1', 'recyclable_lag1', 
+                    'biodegradable_rolling_mean', 'residual_rolling_mean', 'recyclable_rolling_mean']]
     y = data_pivot[['Biodegradable', 'Residual', 'Recyclable']]
 
-    # Initialize variables for mean accuracy and train/test sets
-    mean_accuracy = None
-    X_train, X_test, y_train, y_test = None, None, None, None
+    # Feature Scaling (Standardization)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-    if len(X) < 2:
-        # Not enough data to split; train with all data
-        model = LinearRegression()
-        model.fit(X, y)
-    else:
-        # Train-test split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        model = LinearRegression()
-        model.fit(X_train, y_train)
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-        # Calculate mean accuracy (R² score)
-        y_pred = model.predict(X_test)
-        mean_accuracy = r2_score(y_test, y_pred)
+    # Use GridSearchCV to fine-tune the model
+    ridge = Ridge()
+    lasso = Lasso()
+
+    param_grid = {
+        'alpha': [0.01, 0.1, 1, 10, 100],  # More granular search for Ridge and Lasso
+        'fit_intercept': [True, False]     # Test both with and without intercept
+    }
+
+    # Fine-tune the model using Ridge or Lasso
+    grid_search = GridSearchCV(ridge, param_grid, cv=5, scoring='neg_mean_squared_error')
+    grid_search.fit(X_train, y_train)
+
+    # Best model after hyperparameter tuning
+    model = grid_search.best_estimator_
+
+    # Predict the target for both train and test data
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+
+    # Performance metrics for testing data
+    mse = mean_squared_error(y_test, y_test_pred)
+    mae = mean_absolute_error(y_test, y_test_pred)
+    r2 = r2_score(y_test, y_test_pred)
+
+    # Calculate sMAPE for the test set
+    smape = symmetric_mape(y_test, y_test_pred)
+
+    # Prepare performance metrics
+    performance_metrics = {
+        "mse": mse,
+        "mae": mae,
+        "mape": smape,  # Using sMAPE instead of MAPE
+        "accuracy": r2  # Using R2 as accuracy
+    }
 
     # Predict next month
-    last_month_data = X.tail(1)
+    last_month_data = X_scaled[-1:].reshape(1, -1)  # Use the last data point for prediction
     next_month_prediction = model.predict(last_month_data)
 
     # Get next month’s date range
@@ -105,7 +149,5 @@ async def predict_next_month():
         recyclable=next_month_prediction[0][2],
         start_date=str(next_month_start.date()),
         end_date=str(next_month_end.date()),
-        mean_accuracy=mean_accuracy if mean_accuracy is not None else 0.0  # Return 0.0 if not calculated
+        performance_metrics=performance_metrics
     )
-
-# uvicorn app:app --reload
